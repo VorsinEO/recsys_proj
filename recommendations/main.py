@@ -1,3 +1,4 @@
+import json
 import random
 from typing import List
 
@@ -27,8 +28,7 @@ def cleanup():
     global unique_item_ids
     unique_item_ids = set()
     try:
-        redis_connection.delete('*')
-        redis_connection.json().delete('*')
+        redis_connection.flushdb()
     except redis.exceptions.ConnectionError:
         pass
     return 200
@@ -47,12 +47,17 @@ def get_recs(user_id: str):
     global unique_item_ids
 
     try:
-        item_ids = redis_connection.json().get('top_items')
-    except redis.exceptions.ConnectionError:
+        payload = redis_connection.get('top_items')
+        item_ids = json.loads(payload) if payload else None
+    except (redis.exceptions.ConnectionError, redis.exceptions.ResponseError, TypeError, json.JSONDecodeError):
         item_ids = None
 
     if item_ids is None or random.random() < EPSILON:
-        item_ids = np.random.choice(list(unique_item_ids), size=20, replace=False).tolist()
+        if not unique_item_ids:
+            item_ids = []
+        else:
+            sample_size = min(20, len(unique_item_ids))
+            item_ids = np.random.choice(list(unique_item_ids), size=sample_size, replace=False).tolist()
     return RecommendationsResponse(item_ids=item_ids)
 
 

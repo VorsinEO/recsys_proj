@@ -38,13 +38,15 @@
 <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
 <script>
     $(document).ready(function () {
+        const userId = {{ user_id|tojson }};
+
         $('.like-button, .dislike-button').on('click', function () {
             let item_id = $(this).data('item');
             let action = $(this).hasClass('like-button') ? 'like' : 'dislike';
 
             $.ajax({
                 type: 'POST',
-                url: '{{ interactions_url }}/interact',
+                url: '/interact',
                 contentType: 'application/json',
                 data: JSON.stringify({user_id: getUserID(), item_ids: [item_id.toString()], actions: [action]}),
                 success: function (response) {
@@ -57,8 +59,7 @@
         });
 
         function getUserID() {
-            // Implement a function to retrieve the user's ID from cookies
-            return 'user_id';  // Replace with actual code to fetch user ID from cookies
+            return userId;
         }
     });
 </script>

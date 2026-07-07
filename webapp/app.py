@@ -8,8 +8,8 @@ from flask import Flask, render_template, session, request
 app = Flask(__name__)
 app.secret_key = os.urandom(24)
 
-recommendation_service_url = "http://135.181.153.151:5001"
-interactions_url = 'http://135.181.153.151:5000'
+recommendation_service_url = os.environ.get('RECOMMENDATION_SERVICE_URL', 'http://127.0.0.1:5001')
+interactions_service_url = os.environ.get('INTERACTIONS_SERVICE_URL', 'http://127.0.0.1:5000')
 
 links_data = (
     pl.read_csv('static/links.csv')
@@ -67,8 +67,18 @@ def index():
     return render_template(
         'index.html',
         items_data=items_data,
-        interactions_url=interactions_url
+        user_id=user_id,
     )
+
+
+@app.post('/interact')
+def interact():
+    response = requests.post(
+        f'{interactions_service_url}/interact',
+        json=request.get_json(),
+        timeout=5,
+    )
+    return ('', response.status_code)
 
 
 def get_user_id_from_cookies():
@@ -94,4 +104,4 @@ if __name__ == '__main__':
         "item_ids": list(map(str, movie_id_title.keys())),
     }
     requests.post(f'{recommendation_service_url}/add_items', json=data)
-    app.run(debug=True, port=8000)
+    app.run(host='0.0.0.0', debug=True, port=8000)

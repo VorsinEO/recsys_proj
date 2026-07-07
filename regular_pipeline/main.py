@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os.path
+from pathlib import Path
 import time
 
 import aio_pika
@@ -9,6 +10,17 @@ import redis
 from aio_pika import Message
 
 redis_connection = redis.Redis('localhost')
+DATA_DIR = Path(__file__).resolve().parent.parent / 'data'
+INTERACTIONS_PATH = DATA_DIR / 'interactions.csv'
+
+
+def normalize_interactions(df: pl.DataFrame) -> pl.DataFrame:
+    return df.with_columns([
+        pl.col('user_id').cast(pl.Utf8),
+        pl.col('item_id').cast(pl.Utf8),
+        pl.col('action').cast(pl.Utf8),
+        pl.col('timestamp').cast(pl.Float64),
+    ])
 
 
 async def collect_messages():
@@ -48,13 +60,15 @@ async def collect_messages():
                             'item_ids': 'item_id',
                             'actions': 'action'
                         })
+                        new_data = normalize_interactions(new_data)
 
                         if len(new_data) > 0:
-                            if os.path.exists('../data/interactions.csv'):
-                                data = pl.concat([pl.read_csv('../data/interactions.csv'), new_data])
+                            DATA_DIR.mkdir(parents=True, exist_ok=True)
+                            if INTERACTIONS_PATH.exists():
+                                data = pl.concat([normalize_interactions(pl.read_csv(INTERACTIONS_PATH)), new_data])
                             else:
                                 data = new_data
-                            data.write_csv('../data/interactions.csv')
+                            data.write_csv(INTERACTIONS_PATH)
 
                         data = []
                         t_start = time.time()
@@ -65,9 +79,9 @@ async def collect_messages():
 
 async def calculate_top_recommendations():
     while True:
-        if os.path.exists('../data/interactions.csv'):
+        if INTERACTIONS_PATH.exists():
             print('calculating top recommendations')
-            interactions = pl.read_csv('../data/interactions.csv')
+            interactions = normalize_interactions(pl.read_csv(INTERACTIONS_PATH))
             top_items = (
                 interactions
                 .sort('timestamp')
@@ -81,7 +95,7 @@ async def calculate_top_recommendations():
 
             top_items = [str(item_id) for item_id in top_items]
 
-            redis_connection.json().set('top_items', '.', top_items)
+            redis_connection.set('top_items', json.dumps(top_items))
         await asyncio.sleep(10)
 
 
