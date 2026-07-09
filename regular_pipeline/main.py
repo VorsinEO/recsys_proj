@@ -1,24 +1,37 @@
 import asyncio
 import json
+import sys
 from pathlib import Path
 import time
+
+ROOT_DIR = Path(__file__).resolve().parent.parent
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
 
 import aio_pika
 import polars as pl
 import redis
 
+from catalog_store import get_catalog
+from config import (
+    FLUSH_INTERVAL_SEC,
+    GLOBAL_CANDIDATES_KEY,
+    INTERACTIONS_PATH,
+    RECOMPUTE_INTERVAL_SEC,
+    USER_CANDIDATES_PREFIX,
+    USER_DISLIKED_PREFIX,
+    DATA_DIR,
+)
+from scoring import (
+    build_global_candidates,
+    build_user_candidates,
+    build_user_dislikes,
+    build_user_profiles,
+    build_popularity,
+    normalize_interactions,
+)
+
 redis_connection = redis.Redis('localhost')
-DATA_DIR = Path(__file__).resolve().parent.parent / 'data'
-INTERACTIONS_PATH = DATA_DIR / 'interactions.csv'
-
-
-def normalize_interactions(df: pl.DataFrame) -> pl.DataFrame:
-    return df.with_columns([
-        pl.col('user_id').cast(pl.Utf8),
-        pl.col('item_id').cast(pl.Utf8),
-        pl.col('action').cast(pl.Utf8),
-        pl.col('timestamp').cast(pl.Float64),
-    ])
 
 
 def flush_interactions(buffer: list[dict]) -> None:
@@ -57,16 +70,9 @@ async def collect_messages():
     routing_key = "user.interact.message"
 
     async with connection:
-        # Creating channel
         channel = await connection.channel()
-
-        # Will take no more than 10 messages in advance
         await channel.set_qos(prefetch_count=10)
-
-        # Declaring queue
         queue = await channel.declare_queue(queue_name)
-
-        # Declaring exchange
         exchange = await channel.declare_exchange("user.interact", type='direct')
         await queue.bind(exchange, routing_key)
 
@@ -76,43 +82,70 @@ async def collect_messages():
             message = await queue.get(timeout=1, fail=False)
             if message is not None:
                 async with message.process():
-                    message = message.body.decode()
-                    message = json.loads(message)
+                    message = json.loads(message.body.decode())
                     data.append(message)
 
-            if data and time.time() - t_start > 10:
+            if data and time.time() - t_start > FLUSH_INTERVAL_SEC:
                 print('saving events from rabbitmq')
                 flush_interactions(data)
                 data = []
                 t_start = time.time()
 
 
-async def calculate_top_recommendations():
+def recompute_recommendations() -> None:
+    catalog = get_catalog(redis_connection)
+    if not catalog:
+        return
+
+    if INTERACTIONS_PATH.exists():
+        interactions = normalize_interactions(pl.read_csv(INTERACTIONS_PATH))
+    else:
+        interactions = normalize_interactions(pl.DataFrame({
+            'user_id': [],
+            'item_id': [],
+            'action': [],
+            'timestamp': [],
+        }))
+
+    popularity = build_popularity(interactions)
+    profiles = build_user_profiles(interactions, catalog)
+    dislikes = build_user_dislikes(interactions)
+
+    global_candidates = build_global_candidates(catalog, popularity)
+    redis_connection.set(GLOBAL_CANDIDATES_KEY, json.dumps(global_candidates))
+
+    user_ids = set(profiles.keys()) | set(dislikes.keys())
+    if len(interactions) > 0:
+        user_ids.update(str(user_id) for user_id in interactions['user_id'].to_list())
+
+    for user_id in user_ids:
+        candidates = build_user_candidates(
+            user_id=user_id,
+            catalog=catalog,
+            popularity=popularity,
+            profiles=profiles,
+            dislikes=dislikes,
+        )
+        redis_connection.set(f'{USER_CANDIDATES_PREFIX}{user_id}', json.dumps(candidates))
+        redis_connection.set(
+            f'{USER_DISLIKED_PREFIX}{user_id}',
+            json.dumps(sorted(dislikes.get(user_id, set()))),
+        )
+
+    print(f'calculated recommendations for {len(user_ids)} users')
+
+
+async def calculate_recommendations_loop():
     while True:
-        if INTERACTIONS_PATH.exists():
-            print('calculating top recommendations')
-            interactions = normalize_interactions(pl.read_csv(INTERACTIONS_PATH))
-            top_items = (
-                interactions
-                .sort('timestamp')
-                .unique(['user_id', 'item_id'], keep='last')
-                .filter(pl.col('action') == 'like')
-                .groupby('item_id')
-                .count()
-                .sort('count', descending=True)
-                .head(100)
-            )['item_id'].to_list()
-
-            top_items = [str(item_id) for item_id in top_items]
-
-            redis_connection.set('top_items', json.dumps(top_items))
-        await asyncio.sleep(10)
+        print('calculating recommendations')
+        recompute_recommendations()
+        await asyncio.sleep(RECOMPUTE_INTERVAL_SEC)
 
 
 async def main():
     await asyncio.gather(
         collect_messages(),
-        calculate_top_recommendations(),
+        calculate_recommendations_loop(),
     )
 
 

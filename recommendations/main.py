@@ -1,21 +1,15 @@
-import json
-import random
-from typing import List
-
-import numpy as np
 import redis
 from fastapi import FastAPI
 
-from models import InteractEvent, RecommendationsResponse, NewItemsEvent
+from models import InteractEvent, NewItemsEvent, RecommendationsResponse
+from recommendations.service import add_catalog_items, build_recommendations
+from state_cleanup import archive_interactions_csv, purge_rabbitmq_queue
 from watched_filter import WatchedFilter
 
 app = FastAPI()
 
 redis_connection = redis.Redis('localhost')
-watched_filter = WatchedFilter()
-
-unique_item_ids = set()
-EPSILON = 0.05
+watched_filter = WatchedFilter(redis_connection)
 
 
 @app.get('/healthcheck')
@@ -25,43 +19,29 @@ def healthcheck():
 
 @app.get('/cleanup')
 def cleanup():
-    global unique_item_ids
-    unique_item_ids = set()
+    archive_interactions_csv()
     try:
         redis_connection.flushdb()
     except redis.exceptions.ConnectionError:
         pass
+    purge_rabbitmq_queue()
     return 200
 
 
 @app.post('/add_items')
 def add_movie(request: NewItemsEvent):
-    global unique_item_ids
-    for item_id in request.item_ids:
-        unique_item_ids.add(item_id)
+    add_catalog_items(redis_connection, request.item_ids, request.genres)
     return 200
 
 
 @app.get('/recs/{user_id}')
 def get_recs(user_id: str):
-    global unique_item_ids
-
-    try:
-        payload = redis_connection.get('top_items')
-        item_ids = json.loads(payload) if payload else None
-    except (redis.exceptions.ConnectionError, redis.exceptions.ResponseError, TypeError, json.JSONDecodeError):
-        item_ids = None
-
-    if item_ids is None or random.random() < EPSILON:
-        if not unique_item_ids:
-            item_ids = []
-        else:
-            sample_size = min(20, len(unique_item_ids))
-            item_ids = np.random.choice(list(unique_item_ids), size=sample_size, replace=False).tolist()
+    item_ids = build_recommendations(redis_connection, watched_filter, user_id)
     return RecommendationsResponse(item_ids=item_ids)
 
 
 @app.post('/interact')
 async def interact(request: InteractEvent):
-    watched_filter.add(request.user_id, request.item_id)
+    for item_id in request.item_ids:
+        watched_filter.add(request.user_id, item_id)
     return 200
