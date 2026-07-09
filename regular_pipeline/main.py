@@ -1,13 +1,11 @@
 import asyncio
 import json
-import os.path
 from pathlib import Path
 import time
 
 import aio_pika
 import polars as pl
 import redis
-from aio_pika import Message
 
 redis_connection = redis.Redis('localhost')
 DATA_DIR = Path(__file__).resolve().parent.parent / 'data'
@@ -21,6 +19,32 @@ def normalize_interactions(df: pl.DataFrame) -> pl.DataFrame:
         pl.col('action').cast(pl.Utf8),
         pl.col('timestamp').cast(pl.Float64),
     ])
+
+
+def flush_interactions(buffer: list[dict]) -> None:
+    if not buffer:
+        return
+
+    new_data = (
+        pl.DataFrame(buffer)
+        .explode(['item_ids', 'actions'])
+        .rename({
+            'item_ids': 'item_id',
+            'actions': 'action',
+        })
+    )
+    new_data = normalize_interactions(new_data)
+
+    if len(new_data) == 0:
+        return
+
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    if INTERACTIONS_PATH.exists():
+        existing_data = normalize_interactions(pl.read_csv(INTERACTIONS_PATH))
+        all_data = pl.concat([existing_data, new_data], how='vertical')
+    else:
+        all_data = new_data
+    all_data.write_csv(INTERACTIONS_PATH)
 
 
 async def collect_messages():
@@ -45,36 +69,22 @@ async def collect_messages():
         # Declaring exchange
         exchange = await channel.declare_exchange("user.interact", type='direct')
         await queue.bind(exchange, routing_key)
-        # await exchange.publish(Message(bytes(queue.name, "utf-8")), routing_key)
 
         t_start = time.time()
         data = []
-        async with queue.iterator() as queue_iter:
-            async for message in queue_iter:
+        while True:
+            message = await queue.get(timeout=1, fail=False)
+            if message is not None:
                 async with message.process():
                     message = message.body.decode()
-                    if time.time() - t_start > 10:
-                        print('saving events from rabbitmq')
-                        # update data if 10s passed
-                        new_data = pl.DataFrame(data).explode(['item_ids', 'actions']).rename({
-                            'item_ids': 'item_id',
-                            'actions': 'action'
-                        })
-                        new_data = normalize_interactions(new_data)
-
-                        if len(new_data) > 0:
-                            DATA_DIR.mkdir(parents=True, exist_ok=True)
-                            if INTERACTIONS_PATH.exists():
-                                data = pl.concat([normalize_interactions(pl.read_csv(INTERACTIONS_PATH)), new_data])
-                            else:
-                                data = new_data
-                            data.write_csv(INTERACTIONS_PATH)
-
-                        data = []
-                        t_start = time.time()
-
                     message = json.loads(message)
                     data.append(message)
+
+            if data and time.time() - t_start > 10:
+                print('saving events from rabbitmq')
+                flush_interactions(data)
+                data = []
+                t_start = time.time()
 
 
 async def calculate_top_recommendations():
@@ -85,7 +95,7 @@ async def calculate_top_recommendations():
             top_items = (
                 interactions
                 .sort('timestamp')
-                .unique(['user_id', 'item_id', 'action'], keep='last')
+                .unique(['user_id', 'item_id'], keep='last')
                 .filter(pl.col('action') == 'like')
                 .groupby('item_id')
                 .count()
