@@ -10,12 +10,38 @@
 | Ранние (pipeline/cold) | ~22% | 0.03 | ~0 | 0.08 | 0.81 | ok |
 | Online + popular/co-like | 49.6% | 0.28 | 0.030 (19%) | 0.30 | 0.75 | 71ms |
 | Forced head + soft co-like | 56.4% | 0.36 | 0.043 (47%) | 0.34 | 0.68 | 49ms |
-| **Заявленный последний** | **58.4%** | **0.415 (100%)** | **0.049 (58%)** | **0.338 (34%)** | **0.650 (100%)** | **40ms** |
+| Explore/unseen (заявл.) | 58.4% | 0.415 | 0.049 (58%) | 0.338 | 0.650 | 40ms |
+| UC explore=0 + 2nd-tier | ~82.4%* | 0.474 (100%) | 0.057 (73%) | 0.371 (39%) | 0.643 (100%) | 34ms (20/20) |
+| **Slim pipeline (no dirty UC)** | **~96%**** | **0.932 (100%)** | **0.103 (100%)** | **0.657 (80%)** | **0.767 (100%)** | **29ms (20/20)** |
 
-Баллы по блокам на 58.4%:
-- `test_metrics`: **31.6 / 40** (precision max, NDCG ещё −17pp до потолка шкалы)
-- `test_extra_metrics`: **26.8 / 40** (coverage −, diversity max)
-- `test_response_time`: **0 / 20** в UI (при mean 40ms — бонус, видимо, только при ≥30 по «остальным» или отдельном правиле; уточнить по `task_desc`, но latency уже не проблема)
+\*34.4+28+20 = 82.4. \*\*40+36+20 = 96. Остаток: coverage 0.66→0.80 (−4 балла).
+
+Баллы на прогоне ~96%:
+- `test_metrics`: **40 / 40**
+- `test_extra_metrics`: **36 / 40** (coverage 80% шкалы, diversity max)
+- `test_response_time`: **20 / 20** (mean 29ms)
+
+### Coverage push (следующий прогон)
+- Было: explore из long-tail global pool (~220) → unique 16073 / ~24460 = 0.66
+- Нужно ~19.5k unique (+3.5k)
+- Фикс: `SRANDMEMBER catalog:all` на explore; cold=3 слота, UC=1 слот (P/NDCG с огромным запасом)
+
+### Latency note (прогон ~82%)
+- Грейдер mean **/recs = 34ms** — бонус полный; «долго» ≠ медленный `/recs`.
+- Wall-time `test_metrics` ~1080s — длительность сценария грейдера (~18 мин, ~52 /recs/s), не наша latency.
+- Лог: `/recs` p50≈5ms, p95≈24ms, max≈161ms; к концу прогона p50 растёт до ~8ms (Redis/impressions).
+- Cold path был тяжелее из‑за per-request HMGET в rare-explore (~27ms bench) — **убран**, explore = rotate long-tail.
+- `/interact` online_update ~25ms p50 — ок; 1 worker uvicorn на collector.
+
+### Pipeline bottleneck (главный «долго» в логе)
+Лог `dirty_left=900→1058`, `40 users in 3–10s`:
+- Flush добавлял всех interact-юзеров в `dirty_users`.
+- Recompute читал **весь** CSV, строил профили/каталог и пересчитывал UC **без co-like** → перетирал online_update.
+- При ~36 interact/s очередь dirty росла быстрее, чем 40/цикл.
+
+**Фикс:** pipeline больше не делает per-user dirty recompute. Роли:
+- `/interact` online_update → `user_candidates` (источник правды)
+- pipeline → append CSV + co-like на multi-like flush + periodic `global_candidates` / full co-like rebuild
 
 **Запас по «бесплатным» метрикам:** precision и diversity уже 100% баллов — ими можно жертвовать ради NDCG и coverage.
 
@@ -81,17 +107,23 @@ add_items → Redis catalog + genre index + cheap global_candidates
 
 ## 5. План на вечер (приоритет)
 
+### Сделано 2026-07-09 вечер (пробуем следующий прогон)
+1. **UC explore_slots=0** — top-10 целиком по ранжированию (NDCG); explore только на cold (2 слота).
+2. **Rare explore** — cold explore берёт low-impression / long-tail, не mega-hits.
+3. **Second-tier mid** — cold mid ротирует popular ranks ~5–80; UC mid скипает top-8 mega-hits.
+4. **Сильнее co-like** (`CO_LIKE_BOOST=18`, слабее pop в UC) — порядок UC ближе к item-CF.
+5. Багфикс: `_pick_with_explore` при slots=0 больше не раздувает список.
+
 ### P0 — добить NDCG (ожидаемый +score)
-1. **Ещё жёстче UC top-5 = только unseen high-score**  
-   Уже сделано в последнем коде; если официальный score после этого прогона всё ещё ~58% — смотреть, не размывают ли explore-слоты (позиции 9–10) NDCG. Вариант: explore только если `shown_count` мал / только 1 слот.
+1. ~~UC top-5 unseen~~ + **explore только на cold** ← в прогоне.
 2. **Не ротировать UC head** (уже убрано) — не возвращать.
 3. **Per-user порядок среди top hits на cold** оставить; на UC — стабильный score order.
-4. Проверить: доля лайков на rank1–3 у UC ≥ 55–60% (сейчас proxy ~44%).
+4. Проверить: доля лайков на rank1–3 у UC ≥ 55–60% (было proxy ~44%).
 
 ### P1 — coverage без убийства precision
-1. Оставить 1–2 explore slot, но брать из **редких** айтемов (низкий impression / не из top-100 popular).
-2. Увеличить unique в mid-tail: ротация не только tail global, но и «второй эшелон» popular (ranks 36–150), а не повтор top-5.
-3. Цель реалистичная на hit-based системе: coverage **0.45–0.55**, не 0.8. Для 0.8 нужен явный exploration policy / меньше hit-bias в cold.
+1. ~~Rare explore на cold~~ ← в прогоне.
+2. ~~Second-tier popular в mid~~ ← в прогоне.
+3. Цель реалистичная на hit-based системе: coverage **0.45–0.55**, не 0.8.
 
 ### P2 — не трогать без нужды
 - Latency path (`add_items` batch, fast global candidates).

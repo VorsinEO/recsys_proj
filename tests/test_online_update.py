@@ -86,7 +86,7 @@ def test_unseen_preferred_in_head_after_shown(redis_client):
     assert '7' not in candidates[:5]
 
 
-def test_recs_keep_explore_slots(redis_client):
+def test_recs_explore_only_on_cold(redis_client):
     save_items(
         redis_client,
         [str(i) for i in range(1, 101)],
@@ -94,10 +94,21 @@ def test_recs_keep_explore_slots(redis_client):
     )
     for item_id in map(str, range(1, 20)):
         redis_client.zincrby('popular_likes', 30, item_id)
-    update_user_from_interact(redis_client, 'u-exp', ['1'], ['like'])
-    items, meta = build_recommendations(redis_client, WatchedFilter(redis_client), 'u-exp')
-    assert len(items) == 10
-    assert meta['explore_slots'] == 2
+
+    cold_items, cold_meta = build_recommendations(
+        redis_client, WatchedFilter(redis_client), 'u-cold-exp',
+    )
+    assert len(cold_items) == 10
+    assert cold_meta['source'] == 'cold_start'
+    assert cold_meta['explore_slots'] == 3
+
+    update_user_from_interact(redis_client, 'u-uc-exp', ['1'], ['like'])
+    uc_items, uc_meta = build_recommendations(
+        redis_client, WatchedFilter(redis_client), 'u-uc-exp',
+    )
+    assert len(uc_items) == 10
+    assert uc_meta['source'] == 'user_candidates'
+    assert uc_meta['explore_slots'] == 1
 
 
 def test_global_candidates_prefer_popular(redis_client):
@@ -117,3 +128,26 @@ def test_cold_start_rotates_head(redis_client):
     assert set(b[:5]) == set(items[:5])
     assert a[:5] != b[:5] or a[5:] != b[5:]
     assert rotate_list(['1', '2', '3'], 'x') != rotate_list(['1', '2', '3'], 'y')
+
+
+def test_online_mid_prefers_second_tier(redis_client):
+    save_items(
+        redis_client,
+        [str(i) for i in range(1, 61)],
+        [['Action'] for _ in range(60)],
+    )
+    # Mega-hits 2..9, second-tier 20..35.
+    for item_id, score in [(str(i), 100 - i) for i in range(2, 10)]:
+        redis_client.zincrby('popular_likes', score, item_id)
+    for item_id, score in [(str(i), 40 - (i - 20)) for i in range(20, 36)]:
+        redis_client.zincrby('popular_likes', score, item_id)
+
+    WatchedFilter(redis_client).add('u-mid', [str(i) for i in range(2, 7)])
+    meta = update_user_from_interact(redis_client, 'u-mid', ['1'], ['like'])
+    assert meta['updated'] is True
+    candidates = json.loads(redis_client.get(f'{USER_CANDIDATES_PREFIX}u-mid'))
+    # After forced head, mid should surface second-tier before remaining mega-hits.
+    mid = candidates[5:20]
+    second_tier_hits = sum(1 for item_id in mid if 20 <= int(item_id) <= 35)
+    mega_hits = sum(1 for item_id in mid if 2 <= int(item_id) <= 9)
+    assert second_tier_hits >= mega_hits

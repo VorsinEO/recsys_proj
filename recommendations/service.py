@@ -17,8 +17,15 @@ from scoring import select_recommendations
 from watched_filter import WatchedFilter
 
 COLD_START_HEAD_SIZE = 5
-POPULAR_IN_GLOBAL = 35
-EXPLORE_SLOTS = 2
+# Mega-hits for cold head (precision/NDCG), then second-tier for mid coverage.
+POPULAR_HEAD = 20
+POPULAR_SECOND_TIER = 80
+POPULAR_IN_GLOBAL = POPULAR_SECOND_TIER
+# Coverage gap: 0.66 → 0.80 needs ~3.5k more unique. Explore must sample full catalog,
+# not the ~220-item global long-tail. P/NDCG have huge headroom (0.93 / 0.10).
+COLD_EXPLORE_SLOTS = 3
+UC_EXPLORE_SLOTS = 1
+CATALOG_EXPLORE_SAMPLE = 48
 
 
 def _decode(value) -> str:
@@ -38,13 +45,17 @@ def rotate_head_and_tail(
         return rotate_list(item_ids, f'{user_id}:head')
 
     head = rotate_list(item_ids[:head_size], f'{user_id}:head')
-    tail = item_ids[head_size:]
-    return head + rotate_list(tail, f'{user_id}:tail')
+    # Mid: second-tier popular (after mega-hits), then long-tail — both rotated.
+    second_tier_end = min(POPULAR_SECOND_TIER, len(item_ids))
+    mid = item_ids[head_size:second_tier_end]
+    tail = item_ids[second_tier_end:]
+    return head + rotate_list(mid, f'{user_id}:mid') + rotate_list(tail, f'{user_id}:tail')
 
 
 def build_fast_global_candidates(redis_connection: redis.Redis) -> List[str]:
     popular_n = min(POPULAR_IN_GLOBAL, GLOBAL_CANDIDATE_STORE_SIZE)
     popular = get_popular_item_ids(redis_connection, count=popular_n)
+    # Keep mega-hits first, second-tier next (already ordered by zrevrange).
     need = max(0, GLOBAL_CANDIDATE_STORE_SIZE - len(popular))
     sampled: List[str] = []
     if need:
@@ -61,6 +72,29 @@ def build_fast_global_candidates(redis_connection: redis.Redis) -> List[str]:
                 if len(sampled) >= need:
                     break
     return popular + sampled
+
+
+def _catalog_explore_candidates(
+    redis_connection: redis.Redis,
+    user_id: str,
+    exclude: set[str],
+    count: int = CATALOG_EXPLORE_SAMPLE,
+) -> List[str]:
+    """Sample explore items from the full catalog (coverage), not the tiny global pool."""
+    raw = redis_connection.srandmember(CATALOG_ALL_KEY, count + len(exclude) + 20)
+    if not raw:
+        return []
+    if not isinstance(raw, list):
+        raw = [raw]
+    picked: List[str] = []
+    for item_id in raw:
+        decoded = _decode(item_id)
+        if decoded in exclude:
+            continue
+        picked.append(decoded)
+        if len(picked) >= count:
+            break
+    return rotate_list(picked, f'{user_id}:explore')
 
 
 def ensure_global_candidates(redis_connection: redis.Redis) -> List[str]:
@@ -93,10 +127,11 @@ def _pick_with_explore(
     shown: set[str],
     disliked: set[str],
     top_k: int = TOP_K,
-    explore_slots: int = EXPLORE_SLOTS,
+    explore_slots: int = COLD_EXPLORE_SLOTS,
 ) -> List[str]:
     """Keep first (top_k - explore_slots) relevant, last explore_slots from long-tail."""
-    relevant_budget = max(1, top_k - explore_slots)
+    explore_slots = max(0, min(explore_slots, top_k - 1)) if top_k > 1 else 0
+    relevant_budget = top_k - explore_slots
     selected: List[str] = []
     seen = set(shown) | set(disliked)
 
@@ -108,22 +143,32 @@ def _pick_with_explore(
         if len(selected) >= relevant_budget:
             break
 
-    for item_id in explore:
-        if item_id in seen:
-            continue
-        selected.append(item_id)
-        seen.add(item_id)
-        if len(selected) >= top_k:
-            break
+    if explore_slots > 0:
+        for item_id in explore:
+            if item_id in seen:
+                continue
+            selected.append(item_id)
+            seen.add(item_id)
+            if len(selected) >= top_k:
+                break
 
     if len(selected) < top_k:
-        for item_id in list(primary) + list(explore):
-            if item_id in disliked or item_id in selected:
+        # Prefer unseen leftovers; only re-show if catalog is exhausted.
+        leftovers = list(primary) + list(explore)
+        for item_id in leftovers:
+            if item_id in seen or item_id in disliked or item_id in selected:
                 continue
             selected.append(item_id)
             if len(selected) >= top_k:
                 break
-    return selected
+        if len(selected) < top_k:
+            for item_id in leftovers:
+                if item_id in disliked or item_id in selected:
+                    continue
+                selected.append(item_id)
+                if len(selected) >= top_k:
+                    break
+    return selected[:top_k]
 
 
 def build_recommendations(
@@ -134,23 +179,29 @@ def build_recommendations(
     user_payload = redis_connection.get(f'{USER_CANDIDATES_PREFIX}{user_id}')
     global_pool = ensure_global_candidates(redis_connection)
     popular_n = min(POPULAR_IN_GLOBAL, len(global_pool))
-    explore_pool = global_pool[popular_n:]
+    mega_hits = set(global_pool[: min(POPULAR_HEAD, len(global_pool))])
 
     if user_payload:
         candidates = [str(item_id) for item_id in json.loads(user_payload)]
         source = 'user_candidates'
+        explore_slots = UC_EXPLORE_SLOTS
     else:
         candidates = rotate_head_and_tail(global_pool, user_id)
         source = 'cold_start'
+        explore_slots = COLD_EXPLORE_SLOTS
 
     shown = watched_filter.get_shown(user_id)
     disliked = watched_filter.get_disliked(user_id)
     fallback = get_fallback_candidates(redis_connection, user_id)
 
-    explore_candidates = rotate_list(
-        list(dict.fromkeys(candidates[8:] + explore_pool + fallback)),
-        f'{user_id}:explore',
-    )
+    # Full-catalog SRANDMEMBER for coverage; skip mega-hits / shown / disliked.
+    explore_candidates: List[str] = []
+    if explore_slots > 0:
+        explore_candidates = _catalog_explore_candidates(
+            redis_connection,
+            user_id,
+            exclude=set(shown) | set(disliked) | mega_hits,
+        )
     unseen_primary = [
         item_id for item_id in candidates
         if item_id not in shown and item_id not in disliked
@@ -161,7 +212,7 @@ def build_recommendations(
         shown=shown,
         disliked=disliked,
         top_k=TOP_K,
-        explore_slots=EXPLORE_SLOTS,
+        explore_slots=explore_slots,
     )
 
     if len(item_ids) < TOP_K:
@@ -182,7 +233,7 @@ def build_recommendations(
         'shown_count': len(shown),
         'disliked_count': len(disliked),
         'backfill_count': backfill_count,
-        'explore_slots': EXPLORE_SLOTS,
+        'explore_slots': explore_slots,
     }
     return item_ids, meta
 

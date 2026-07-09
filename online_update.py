@@ -20,13 +20,17 @@ from watched_filter import WatchedFilter
 USER_PROFILE_PREFIX = 'user_profile:'
 POPULAR_LIKES_KEY = 'popular_likes'
 CO_LIKE_PREFIX = 'co_like:'
-ONLINE_POPULAR_SCAN = 350
-ONLINE_CO_LIKE_PER_ITEM = 50
+ONLINE_POPULAR_SCAN = 400
+ONLINE_CO_LIKE_PER_ITEM = 60
 ONLINE_RANDOM_PER_GENRE = 80
 FORCED_HEAD_SIZE = 5
-TOP_POPULAR_SLOTS = 50
+# Mid: skip mega-hits already likely shown in cold; prefer second-tier popular.
+TOP_POPULAR_SKIP = 8
+TOP_POPULAR_SLOTS = 60
 SOFT_CO_LIKE_WEIGHT = 0.5
 SOFT_CO_LIKE_NEIGHBORS = 15
+CO_LIKE_BOOST = 18.0
+POP_BOOST_SCALE = 0.7
 
 
 def _decode(value) -> str:
@@ -168,8 +172,9 @@ def _score_candidate(
         relevance = 0.0
 
     pop = popular_scores.get(item_id, 0.0)
-    pop_boost = 1.0 * (pop ** 0.5) if pop > 0 else 0.0
-    co_boost = 14.0 * co_like_scores.get(item_id, 0.0)
+    # Slightly less mega-hit gravity in UC rest; co-like drives NDCG top ranks.
+    pop_boost = POP_BOOST_SCALE * (pop ** 0.5) if pop > 0 else 0.0
+    co_boost = CO_LIKE_BOOST * co_like_scores.get(item_id, 0.0)
     return relevance + pop_boost + co_boost
 
 
@@ -277,7 +282,9 @@ def update_user_from_interact(
             if len(head) >= FORCED_HEAD_SIZE:
                 break
 
-    mid = [item_id for item_id in popular_pool if item_id not in used][:TOP_POPULAR_SLOTS]
+    # Prefer second-tier popular in mid (mega-hits often already in cold shown).
+    mid_pool = popular_pool[TOP_POPULAR_SKIP:] + popular_pool[:TOP_POPULAR_SKIP]
+    mid = [item_id for item_id in mid_pool if item_id not in used][:TOP_POPULAR_SLOTS]
     used.update(mid)
     # Exploration tail: prioritize unseen long-tail for coverage.
     unseen_tail = [item_id for item_id in random_fill if item_id not in used and item_id not in shown]
