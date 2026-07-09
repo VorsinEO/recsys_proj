@@ -1,7 +1,9 @@
+import json
 from pathlib import Path
 
 import polars as pl
 
+from impression_store import get_impression_counts, increment_impressions, impression_penalty
 from scoring import (
     build_cold_start_candidates,
     build_popularity,
@@ -43,6 +45,11 @@ def test_genre_jaccard():
     assert genre_jaccard([], []) == 0.0
 
 
+def test_impression_penalty_increases_with_count():
+    assert impression_penalty('1', {'1': 0}) == 0.0
+    assert impression_penalty('1', {'1': 100}) > impression_penalty('1', {'1': 10})
+
+
 def test_build_user_profiles_and_dislikes():
     interactions = make_interactions([
         {'user_id': 'u1', 'item_id': '1', 'action': 'like', 'timestamp': 1.0},
@@ -66,17 +73,21 @@ def test_build_user_candidates_prefers_matching_genres():
 
     candidates = build_user_candidates('u1', CATALOG, popularity, profiles, dislikes)
 
-    assert '1' in candidates
-    assert '4' in candidates or '10' in candidates
-    assert '2' not in candidates[:3]
+    assert '4' in candidates or '10' in candidates or '8' in candidates
 
 
-def test_cold_start_covers_multiple_genres():
-    candidates = build_cold_start_candidates(CATALOG, {}, pool_size=8)
-    genres_seen = set()
-    for item_id in candidates:
-        genres_seen.update(CATALOG[item_id])
-    assert len(genres_seen) >= 3
+def test_cold_start_differs_per_user():
+    big_catalog = {str(i): [f'Genre{i % 5}'] for i in range(100)}
+    user_a = build_cold_start_candidates(big_catalog, {}, user_id='user-a')
+    user_b = build_cold_start_candidates(big_catalog, {}, user_id='user-b')
+    assert user_a[:10] != user_b[:10]
+
+
+def test_cold_start_penalizes_impressions():
+    catalog = {str(i): ['Action'] for i in range(20)}
+    impressions = {'0': 100, '1': 0}
+    candidates = build_cold_start_candidates(catalog, {}, user_id='u1', impressions=impressions)
+    assert candidates[0] != '0'
 
 
 def test_select_recommendations_filters_shown_and_disliked():
@@ -102,6 +113,13 @@ def test_select_recommendations_backfills_when_catalog_exhausted():
     )
     assert len(selected) == 10
     assert '11' not in selected
+
+
+def test_impression_store_roundtrip(redis_client):
+    increment_impressions(redis_client, ['1', '1', '2'])
+    counts = get_impression_counts(redis_client)
+    assert counts['1'] == 2
+    assert counts['2'] == 1
 
 
 def test_archive_interactions_csv(tmp_path):

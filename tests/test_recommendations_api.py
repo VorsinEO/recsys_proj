@@ -44,6 +44,7 @@ SAMPLE_ITEMS = {
 def test_healthcheck(client):
     response = client.get('/healthcheck')
     assert response.status_code == 200
+    assert response.json() is True
 
 
 def test_add_items_requires_matching_genres(client):
